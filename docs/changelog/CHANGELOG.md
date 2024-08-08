@@ -48,6 +48,8 @@ The value of `instance` label for those scrape targets will be changed from `<ad
 * BUGFIX: [vmalert](https://docs.victoriametrics.com/vmalert): reduce memory usage when parsing responses with big number of metrics in response. The memory usage was increased in [v1.102.0-rc1](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/tag/v1.102.0-rc1) after attempt to reduce CPU usage for heavy loaded vmalerts.
 * BUGFIX: all VictoriaMetrics components: forcefully set owner/group for release tars to 1000:1000. This helps to avoid unpacking [issues](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/6788) on systems with limitations around UID:GID configuration. See [this pull request](https://github.com/VictoriaMetrics/VictoriaMetrics/pull/6846).
 
+* DEPRECATION: [vmalert](https://docs.victoriametrics.com/vmalert/): remove deprecated cmd-line flags `-datasource.lookback`, `datasource.queryTimeAlignment` and `remoteRead.ignoreRestoreErrors`. Those flags were all deprecated before [v1.101.0](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/tag/v1.101.0).
+
 ## [v1.102.1](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/tag/v1.102.1)
 
 Released at 2024-08-01
