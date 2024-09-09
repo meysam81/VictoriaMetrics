@@ -804,7 +804,8 @@ func (is *indexSearch) getLabelNamesForMetricIDs(qt *querytracer.Tracer, metricI
 
 // SearchLabelValuesWithFiltersOnTimeRange returns label values for the given labelName, tfss and tr.
 func (db *indexDB) SearchLabelValuesWithFiltersOnTimeRange(qt *querytracer.Tracer, labelName string, tfss []*TagFilters, tr TimeRange,
-	maxLabelValues, maxMetrics int, deadline uint64) ([]string, error) {
+	maxLabelValues, maxMetrics int, deadline uint64,
+) ([]string, error) {
 	qt = qt.NewChild("search for label values: labelName=%q, filters=%s, timeRange=%s, maxLabelNames=%d, maxMetrics=%d", labelName, tfss, &tr, maxLabelValues, maxMetrics)
 	defer qt.Done()
 
@@ -844,7 +845,8 @@ func (db *indexDB) SearchLabelValuesWithFiltersOnTimeRange(qt *querytracer.Trace
 }
 
 func (is *indexSearch) searchLabelValuesWithFiltersOnTimeRange(qt *querytracer.Tracer, lvs map[string]struct{}, labelName string, tfss []*TagFilters,
-	tr TimeRange, maxLabelValues, maxMetrics int) error {
+	tr TimeRange, maxLabelValues, maxMetrics int,
+) error {
 	minDate := uint64(tr.MinTimestamp) / msecPerDay
 	maxDate := uint64(tr.MaxTimestamp-1) / msecPerDay
 	if maxDate == 0 || minDate > maxDate || maxDate-minDate > maxDaysForPerDaySearch {
@@ -893,7 +895,8 @@ func (is *indexSearch) searchLabelValuesWithFiltersOnTimeRange(qt *querytracer.T
 }
 
 func (is *indexSearch) searchLabelValuesWithFiltersOnDate(qt *querytracer.Tracer, lvs map[string]struct{}, labelName string, tfss []*TagFilters,
-	date uint64, maxLabelValues, maxMetrics int) error {
+	date uint64, maxLabelValues, maxMetrics int,
+) error {
 	filter, err := is.searchMetricIDsWithFiltersOnDate(qt, tfss, date, maxMetrics)
 	if err != nil {
 		return err
@@ -1518,36 +1521,7 @@ func (db *indexDB) searchMetricNameWithCache(dst []byte, metricID uint64) ([]byt
 		return dst, true
 	}
 
-	// Cannot find the MetricName for the given metricID.
-	// There are the following expected cases when this may happen:
-	//
-	// 1. The corresponding metricID -> metricName entry isn't visible for search yet.
-	//    The solution is to wait for some time and try the search again.
-	//    It is OK if newly registered time series isn't visible for search during some time.
-	//    This should resolve https://github.com/VictoriaMetrics/VictoriaMetrics/issues/5959
-	//
-	// 2. The metricID -> metricName entry doesn't exist in the indexdb.
-	//    This is possible after unclean shutdown or after restoring of indexdb from a snapshot.
-	//    In this case the metricID must be deleted, so new metricID is registered
-	//    again when new sample for the given metricName is ingested next time.
-	//
-	ct := fasttime.UnixTimestamp()
-	db.s.missingMetricIDsLock.Lock()
-	if ct > db.s.missingMetricIDsResetDeadline {
-		db.s.missingMetricIDs = nil
-		db.s.missingMetricIDsResetDeadline = ct + 2*60
-	}
-	deleteDeadline, ok := db.s.missingMetricIDs[metricID]
-	if !ok {
-		if db.s.missingMetricIDs == nil {
-			db.s.missingMetricIDs = make(map[uint64]uint64)
-		}
-		deleteDeadline = ct + 60
-		db.s.missingMetricIDs[metricID] = deleteDeadline
-	}
-	db.s.missingMetricIDsLock.Unlock()
-
-	if ct > deleteDeadline {
+	if db.s.shouldDeleteMissingMetricID(metricID) {
 		// Cannot find the MetricName for the given metricID for the last 60 seconds.
 		// It is likely the indexDB contains incomplete set of metricID -> metricName entries
 		// after unclean shutdown or after restoring from a snapshot.
@@ -1810,6 +1784,7 @@ func (db *indexDB) getTSIDsFromMetricIDs(qt *querytracer.Tracer, metricIDs []uin
 	tsidsFound := i
 	qt.Printf("found %d tsids for %d metricIDs in the current indexdb", tsidsFound, len(metricIDs))
 
+	var metricIDsToDelete []uint64
 	if len(extMetricIDs) > 0 {
 		// Search for extMetricIDs in the previous indexdb (aka extDB)
 		db.doExtDB(func(extDB *indexDB) {
@@ -1829,7 +1804,10 @@ func (db *indexDB) getTSIDsFromMetricIDs(qt *querytracer.Tracer, metricIDs []uin
 					// This may be the case on incomplete indexDB
 					// due to snapshot or due to unflushed entries.
 					// Just increment errors counter and skip it for now.
-					is.db.missingTSIDsForMetricID.Add(1)
+					if is.db.s.shouldDeleteMissingMetricID(metricID) {
+						is.db.missingTSIDsForMetricID.Add(1)
+						metricIDsToDelete = append(metricIDsToDelete, metricID)
+					}
 					continue
 				}
 				is.db.putToMetricIDCache(metricID, tsid)
@@ -1844,6 +1822,11 @@ func (db *indexDB) getTSIDsFromMetricIDs(qt *querytracer.Tracer, metricIDs []uin
 
 	tsids = tsids[:i]
 	qt.Printf("load %d tsids for %d metricIDs from both current and previous indexdb", len(tsids), len(metricIDs))
+
+	if len(metricIDsToDelete) > 0 {
+		qt.Printf("found %d missing entries for metricID->TSID mapping, deleting it from indexdb", len(metricIDs))
+		db.deleteMetricIDs(metricIDsToDelete)
+	}
 
 	// Sort the found tsids, since they must be passed to TSID search
 	// in the sorted order.
@@ -2896,7 +2879,8 @@ func (is *indexSearch) hasDateMetricIDNoExtDB(date, metricID uint64) bool {
 }
 
 func (is *indexSearch) getMetricIDsForDateTagFilter(qt *querytracer.Tracer, tf *tagFilter, date uint64, commonPrefix []byte,
-	maxMetrics int, maxLoopsCount int64) (*uint64set.Set, int64, error) {
+	maxMetrics int, maxLoopsCount int64,
+) (*uint64set.Set, int64, error) {
 	if qt.Enabled() {
 		qt = qt.NewChild("get metric ids for filter and date: filter={%s}, date=%s, maxMetrics=%d, maxLoopsCount=%d", tf, dateToString(date), maxMetrics, maxLoopsCount)
 		defer qt.Done()
@@ -3313,8 +3297,10 @@ func mergeTagToMetricIDsRowsInternal(data []byte, items []mergeset.Item, nsPrefi
 	return dstData, dstItems
 }
 
-var indexBlocksWithMetricIDsIncorrectOrder atomic.Uint64
-var indexBlocksWithMetricIDsProcessed atomic.Uint64
+var (
+	indexBlocksWithMetricIDsIncorrectOrder atomic.Uint64
+	indexBlocksWithMetricIDsProcessed      atomic.Uint64
+)
 
 func checkItemsSorted(data []byte, items []mergeset.Item) bool {
 	if len(items) == 0 {
